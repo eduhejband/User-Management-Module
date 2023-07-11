@@ -1,7 +1,7 @@
 import { Application, Request, Response } from 'express';
 import axios from 'axios';
 import { DbClient } from './DbClient';
-import { getSigno } from './utils';
+
 
 export class HoroscopeController {
   

@@ -3,7 +3,7 @@ import * as pg from 'pg';
 export class DbClient {
   private pool: Pool;
 
-  constructor() {
+ constructor() {
     this.pool = new Pool({
       user: process.env.DB_USER,
       host: process.env.DB_HOST,

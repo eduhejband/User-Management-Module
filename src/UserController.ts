@@ -4,7 +4,10 @@ import { DbClient } from './DbClient';
 import bcrypt from 'bcrypt';
 import { randomBytes } from 'crypto';
 import { sendEmail } from './mail_config';
-
+import passport from 'passport';
+import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { QueryResult } from 'pg';
+import axios from 'axios';
 
 export class UserController {
   private dbClient: DbClient;
@@ -17,12 +20,21 @@ export class UserController {
       try {
         await this.dbClient.queryWithParams(
           client,
-          'DELETE FROM clientes WHERE email_verified = FALSE AND created_at < NOW() - INTERVAL \'1 hour\'', []
+          'DELETE FROM clientes WHERE email_verified = FALSE AND created_at < NOW() - INTERVAL \'1 hour\'',
+          []
         );
       } finally {
         client.release();
       }
     }, 1000 * 60 * 60); // executa a cada hora
+
+    app.use(passport.initialize());
+    passport.use(new GoogleStrategy({
+      clientID: process.env.CLIENT_ID!,
+      clientSecret: process.env.SECRET_KEY!,
+      callbackURL: process.env.CALLBACK_URL
+    },
+    this.googleAuthCallback.bind(this))); // Método de callback para tratar a resposta do Google
   }
   
 
@@ -30,35 +42,163 @@ export class UserController {
     app.post('/cadastro', [
       check('name').notEmpty().withMessage('Full name is required'),
       check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').isLength({ min: 5 }).withMessage('Password must be at least 5 chars long'),
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter'),
       check('data_nasc').notEmpty().withMessage('Date of birth is required')
     ], this.register.bind(this));
     
     app.post('/login', [
       check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').isLength({ min: 5 }).withMessage('Password must be at least 5 chars long')
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter')
     ], this.login.bind(this));
 
     app.post('/update-name', [
       check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').isLength({ min: 5 }).withMessage('Password must be at least 5 chars long'),
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter'),
       check('newName').notEmpty().withMessage('New name is required')
     ], this.updateName.bind(this));
 
     app.post('/update-dob', [
       check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').isLength({ min: 5 }).withMessage('Password must be at least 5 chars long'),
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter'),
       check('newDOB').notEmpty().withMessage('New date of birth is required')
     ], this.updateDOB.bind(this));
 
-    app.post('/delete-account', [
+    app.delete('/delete-account', [
       check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').isLength({ min: 5 }).withMessage('Password must be at least 5 chars long')
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter')
     ], this.deleteAccount.bind(this));
+
+    app.post('/reset-password/:token', [
+      check('password')
+      .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
+      .matches(/\d/).withMessage('Password must contain a number')
+      .matches(/[a-z]/i).withMessage('Password must contain a letter')
+    ], this.resetPassword.bind(this));
+
+    app.post('/request-password-reset', [
+      check('username').isEmail().withMessage('Invalid e-mail format'),
+    ], this.requestPasswordReset.bind(this));
 
     app.route('/usuarios/verificar-email/:token')
     .get(this.verifyEmail.bind(this));
+
+    app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+    app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), this.googleAuthSuccess.bind(this));
+    app.post('/insert-birthdate-auth', [
+      check('birthdate').notEmpty().withMessage('Data de nascimento é obrigatória'),
+    ], this.insertBirthdateAuth.bind(this));
   }
+
+  private async googleAuthCallback(accessToken: string, refreshToken: string, profile: any, cb: Function) {
+    const client = await this.dbClient.connect();
+    try {
+      // Verificação extra do token de acesso
+      const response = await axios.get(`https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=${accessToken}`);
+      if (response.status !== 200) {
+        throw new Error('Token de acesso inválido');
+      }
+  
+      const { displayName, emails } = profile;
+      const email = emails[0].value;
+  
+      // Verifique se o usuário já está registrado
+      const userCheckQuery = 'SELECT * FROM clientes WHERE username = $1';
+      const userCheckValues = [email];
+      const userCheckResult: QueryResult = await this.dbClient.queryWithParams(client, userCheckQuery, userCheckValues);
+  
+      if (userCheckResult.rows.length === 0) {
+        // Se o usuário não existe, crie um novo
+        const query = 'INSERT INTO clientes (username, email_verified, created_at) VALUES ($1, $2, $3) RETURNING id';
+        const queryValues = [email, true, new Date()];
+        const userResult: QueryResult = await this.dbClient.queryWithParams(client, query, queryValues);
+  
+        const userId = userResult.rows[0].id;
+      }
+  
+      cb(null, profile);
+    } catch (err) {
+      console.error(err);
+      cb(err);
+    } finally {
+      client.release();
+    }
+  }
+  
+  private async googleAuthSuccess(req: Request, res: Response) {
+    const client = await this.dbClient.connect();
+    try {
+      if (!req.user || !('id' in req.user)) {
+        // Se o usuário não estiver autenticado corretamente, redirecione para uma página de erro ou faça o tratamento apropriado
+        res.redirect('/error');
+        return;
+      }
+  
+      const userId = req.user.id;
+  
+      // Verifique se a data de nascimento do usuário foi definida
+      const userCheckQuery = 'SELECT data_nasc FROM clientes WHERE id = $1';
+      const userCheckValues = [userId];
+      const userCheckResult: QueryResult = await this.dbClient.queryWithParams(client, userCheckQuery, userCheckValues);
+  
+      const birthDate = userCheckResult.rows[0].data_nasc;
+  
+      if (!birthDate) {
+        // Se a data de nascimento não estiver definida, redirecione para uma página para inserir a data de nascimento
+        res.redirect('/insert-birthdate-auth');
+      } else {
+        // Se a data de nascimento estiver definida, redirecione para a página inicial
+        res.redirect('/');
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).send('Erro interno do servidor');
+    } finally {
+      client.release();
+    }
+  }
+  
+  private async insertBirthdateAuth(req: Request, res: Response) {
+    const client = await this.dbClient.connect();
+    try {
+      if (!req.user || !('id' in req.user)) {
+        // Se o usuário não estiver autenticado corretamente, redirecione para uma página de erro ou faça o tratamento apropriado
+        res.redirect('/error');
+        return;
+      }
+  
+      const userId = req.user.id;
+      const { birthdate } = req.body;
+  
+      // Atualize a tabela "clientes" com a data de nascimento fornecida
+      const updateQuery = 'UPDATE clientes SET data_nasc = $1 WHERE id = $2';
+      const updateValues = [birthdate, userId];
+      await this.dbClient.queryWithParams(client, updateQuery, updateValues);
+  
+      res.redirect('/');
+    } catch (err) {
+      console.error(err);
+      res.status(500).send('Erro interno do servidor');
+    } finally {
+      client.release();
+    }
+  }
+  
+  
 
   private async register(req: Request, res: Response): Promise<Response> {
     const client = await this.dbClient.connect();
@@ -173,6 +313,103 @@ export class UserController {
       client.release();
     }
   }
+
+  private async requestPasswordReset(req: Request, res: Response): Promise<Response> {
+    const username = req.body.username;
+  
+    const client = await this.dbClient.connect();
+  
+    try {
+      // Verifique se o username existe
+      const userCheck = await client.query('SELECT * FROM clientes WHERE username = $1', [username]);
+      const user = userCheck.rows[0];
+      if (!user) {
+        return res.status(404).json({ error: 'Usuário não encontrado' });
+      }
+  
+      // Gere um novo token de redefinição de senha
+      const token = randomBytes(32).toString('hex');
+  
+      // Defina a data de expiração para 1 hora a partir de agora
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 1);
+  
+      // Delete qualquer token existente para esse usuário
+      await this.dbClient.queryWithParams(client, 'DELETE FROM email_verifications WHERE user_id = $1', [user.id]);
+  
+      // Insira o novo token no banco de dados
+      await this.dbClient.queryWithParams(
+        client,
+        'INSERT INTO email_verifications (user_id, token, expires_at) VALUES ($1, $2, $3)',
+        [user.id, token, expiresAt]
+      );
+  
+      // Gere a URL de redefinição de senha
+      const resetUrl = `${req.protocol}://${req.get('host')}/usuarios/redefinir-senha/${token}`;
+  
+      // Gere o corpo do email
+      const emailBody = `
+        <html>
+          <body>
+            <h1>Redefinição de Senha</h1>
+            <p>Por favor, redefina sua senha clicando no link abaixo:</p>
+            <a href="${resetUrl}">Redefinir senha</a>
+          </body>
+        </html>
+      `;
+  
+      // Envie o email de redefinição de senha
+      await sendEmail(username, 'Redefinição de senha', emailBody);
+  
+      return res.status(200).json({ message: "Solicitação de redefinição de senha enviada! Verifique o seu e-mail." });
+    } finally {
+      client.release();
+    }
+  }
+  
+  private async resetPassword(req: Request, res: Response): Promise<Response> {
+    const token = req.params.token;
+    const newPassword = req.body.password;
+  
+    const client = await this.dbClient.connect();
+  
+    try {
+      // Verifique se o token existe no banco de dados e ainda é válido
+      const resetResult = await this.dbClient.queryWithParams(
+        client,
+        'SELECT * FROM email_verifications WHERE token = $1 AND expires_at > NOW()',
+        [token]
+      );
+  
+      const reset = resetResult.rows[0];
+  
+      if (!reset) {
+        return res.status(400).json({ message: 'Token de redefinição de senha inválido ou expirado' });
+      }
+  
+      // Use bcrypt para criptografar a nova senha
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+  
+      // Atualize a senha do usuário no banco de dados
+      await this.dbClient.queryWithParams(
+        client,
+        'UPDATE clientes SET password = $1 WHERE id = $2',
+        [hashedPassword, reset.user_id]
+      );
+  
+      // Remova o token do banco de dados
+      await this.dbClient.queryWithParams(
+        client,
+        'DELETE FROM email_verifications WHERE id = $1',
+        [reset.id]
+      );
+  
+      return res.status(200).json({ message: 'Senha redefinida com sucesso' });
+    } finally {
+      client.release();
+    }
+  }
+  
   
   private async login(req: Request, res: Response): Promise<Response> {
     const client = await this.dbClient.connect();
