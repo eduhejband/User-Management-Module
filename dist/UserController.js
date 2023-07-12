@@ -21,6 +21,7 @@ const mail_config_1 = require("./mail_config");
 const passport_1 = __importDefault(require("passport"));
 const passport_google_oauth20_1 = require("passport-google-oauth20");
 const axios_1 = __importDefault(require("axios"));
+const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
 class UserController {
     constructor(app) {
         this.dbClient = new DbClient_1.DbClient();
@@ -42,6 +43,11 @@ class UserController {
         }, this.googleAuthCallback.bind(this))); // Método de callback para tratar a resposta do Google
     }
     configureRoutes(app) {
+        const loginLimiter = (0, express_rate_limit_1.default)({
+            windowMs: 15 * 60 * 1000,
+            max: 50,
+            message: 'Too many login attempts from this IP, please try again after 15 minutes.'
+        });
         app.post('/cadastro', [
             (0, express_validator_1.check)('name').notEmpty().withMessage('Full name is required'),
             (0, express_validator_1.check)('username').isEmail().withMessage('Invalid e-mail format'),
@@ -53,12 +59,9 @@ class UserController {
             (0, express_validator_1.check)('terms_accepted').isBoolean().withMessage('Terms acceptance is required'),
             (0, express_validator_1.check)('privacy_accepted').isBoolean().withMessage('Privacy acceptance is required')
         ], this.register.bind(this));
-        app.post('/login', [
+        app.post('/login', loginLimiter, [
             (0, express_validator_1.check)('username').isEmail().withMessage('Invalid e-mail format'),
-            (0, express_validator_1.check)('password')
-                .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
-                .matches(/\d/).withMessage('Password must contain a number')
-                .matches(/[a-z]/i).withMessage('Password must contain a letter')
+            (0, express_validator_1.check)('password').notEmpty().withMessage('Password is required')
         ], this.login.bind(this));
         app.post('/update-name', [
             (0, express_validator_1.check)('username').isEmail().withMessage('Invalid e-mail format'),
