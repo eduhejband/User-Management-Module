@@ -46,7 +46,9 @@ export class UserController {
       .isLength({ min: 7 }).withMessage('Password must be at least 7 chars long')
       .matches(/\d/).withMessage('Password must contain a number')
       .matches(/[a-z]/i).withMessage('Password must contain a letter'),
-      check('data_nasc').notEmpty().withMessage('Date of birth is required')
+      check('data_nasc').notEmpty().withMessage('Date of birth is required'),
+      check('terms_accepted').isBoolean().withMessage('Terms acceptance is required'),
+      check('privacy_accepted').isBoolean().withMessage('Privacy acceptance is required')
     ], this.register.bind(this));
     
     app.post('/login', [
@@ -97,6 +99,11 @@ export class UserController {
     app.route('/usuarios/verificar-email/:token')
     .get(this.verifyEmail.bind(this));
 
+    app.post('/register-whatsapp-number', [
+      passport.authenticate('jwt', { session: false }),
+      check('phoneNumber').notEmpty().withMessage('Phone number is required')
+    ], this.registerWhatsAppNumber.bind(this));
+
     app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
     app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), this.googleAuthSuccess.bind(this));
     app.post('/insert-birthdate-auth', [
@@ -104,10 +111,48 @@ export class UserController {
     ], this.insertBirthdateAuth.bind(this));
   }
 
+  // E então, adicione o método registerWhatsAppNumber no UserController
+  private async registerWhatsAppNumber(req: Request, res: Response) {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+  
+    const client = await this.dbClient.connect();
+    try {
+      await client.query('BEGIN'); // Inicia a transação
+  
+      const { username, phoneNumber } = req.body;
+  
+      const userCheckQuery = 'SELECT * FROM clientes WHERE username = $1';
+      const userCheckValues = [username];
+      const userCheckResult = await this.dbClient.queryWithParams(client, userCheckQuery, userCheckValues);
+  
+      if (userCheckResult.rowCount === 0) {
+        return res.status(400).json({ error: 'User not found' });
+      }
+  
+      const updateQuery = 'UPDATE clientes SET phone_number = $1 WHERE username = $2';
+      const updateValues = [phoneNumber, username];
+      await this.dbClient.queryWithParams(client, updateQuery, updateValues);
+  
+      await client.query('COMMIT'); // Finaliza a transação
+  
+      res.status(200).json({ message: 'Phone number updated successfully' });
+    } catch (err) {
+      console.error(err);
+      await client.query('ROLLBACK'); // Desfaz a transação em caso de erro
+      res.status(500).json({ error: 'Internal server error' });
+    } finally {
+      client.release();
+    }
+  }
+  
   private async googleAuthCallback(accessToken: string, refreshToken: string, profile: any, cb: Function) {
     const client = await this.dbClient.connect();
     try {
-      // Verificação extra do token de acesso
+      await client.query('BEGIN'); // Inicia a transação
+  
       const response = await axios.get(`https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=${accessToken}`);
       if (response.status !== 200) {
         throw new Error('Token de acesso inválido');
@@ -116,23 +161,24 @@ export class UserController {
       const { displayName, emails } = profile;
       const email = emails[0].value;
   
-      // Verifique se o usuário já está registrado
       const userCheckQuery = 'SELECT * FROM clientes WHERE username = $1';
       const userCheckValues = [email];
       const userCheckResult: QueryResult = await this.dbClient.queryWithParams(client, userCheckQuery, userCheckValues);
   
       if (userCheckResult.rows.length === 0) {
-        // Se o usuário não existe, crie um novo
-        const query = 'INSERT INTO clientes (username, email_verified, created_at) VALUES ($1, $2, $3) RETURNING id';
-        const queryValues = [email, true, new Date()];
+        const query = 'INSERT INTO clientes (username, email_verified, terms_accepted, privacy_accepted, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id';
+        const queryValues = [email, true, true, true, new Date()];
         const userResult: QueryResult = await this.dbClient.queryWithParams(client, query, queryValues);
   
         const userId = userResult.rows[0].id;
       }
   
+      await client.query('COMMIT'); // Finaliza a transação
+  
       cb(null, profile);
     } catch (err) {
       console.error(err);
+      await client.query('ROLLBACK'); // Desfaz a transação em caso de erro
       cb(err);
     } finally {
       client.release();
@@ -142,15 +188,15 @@ export class UserController {
   private async googleAuthSuccess(req: Request, res: Response) {
     const client = await this.dbClient.connect();
     try {
+      await client.query('BEGIN'); // Inicia a transação
+  
       if (!req.user || !('id' in req.user)) {
-        // Se o usuário não estiver autenticado corretamente, redirecione para uma página de erro ou faça o tratamento apropriado
         res.redirect('/error');
         return;
       }
   
       const userId = req.user.id;
   
-      // Verifique se a data de nascimento do usuário foi definida
       const userCheckQuery = 'SELECT data_nasc FROM clientes WHERE id = $1';
       const userCheckValues = [userId];
       const userCheckResult: QueryResult = await this.dbClient.queryWithParams(client, userCheckQuery, userCheckValues);
@@ -158,20 +204,21 @@ export class UserController {
       const birthDate = userCheckResult.rows[0].data_nasc;
   
       if (!birthDate) {
-        // Se a data de nascimento não estiver definida, redirecione para uma página para inserir a data de nascimento
         res.redirect('/insert-birthdate-auth');
       } else {
-        // Se a data de nascimento estiver definida, redirecione para a página inicial
         res.redirect('/');
       }
+  
+      await client.query('COMMIT'); // Finaliza a transação
     } catch (err) {
       console.error(err);
+      await client.query('ROLLBACK'); // Desfaz a transação em caso de erro
       res.status(500).send('Erro interno do servidor');
     } finally {
       client.release();
     }
   }
-  
+   
   private async insertBirthdateAuth(req: Request, res: Response) {
     const client = await this.dbClient.connect();
     try {
@@ -207,51 +254,65 @@ export class UserController {
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
-
+  
       // Obtenha os dados do usuário a partir do corpo da requisição
-      const { name, username, password, data_nasc } = req.body;
-
+      const { name, username, password, data_nasc, terms_accepted, privacy_accepted } = req.body;
+  
+      // Verifica se os termos e política de privacidade foram aceitos
+      if (!terms_accepted || !privacy_accepted) {
+        return res.status(400).json({ error: 'Termos de serviço e política de privacidade devem ser aceitos' });
+      }
+  
       // Verifique se o e-mail já está sendo usado
       const userCheck = await client.query('SELECT * FROM clientes WHERE username = $1', [username]);
-      if (userCheck.rows.length > 0) {
+      if (userCheck.rowCount > 0) {
         return res.status(400).json({ error: 'O e-mail já está em uso' });
       }
-
+  
       // Use bcrypt para criptografar a senha
       const hashedPassword = await bcrypt.hash(password, 10);
+      
+      let userResult;
+      let token;
 
-      // Começa a transação
-      await client.query('BEGIN');
+      try {
+        // Iniciar transação
+        await client.query('BEGIN');
 
-      // Adicione o usuário ao banco de dados
-      const query = 'INSERT INTO clientes (name, username, password, data_nasc) VALUES ($1, $2, $3, $4) RETURNING id';
-      const userResult = await client.query(query, [name, username, hashedPassword, data_nasc]);
+        // Adicione o usuário ao banco de dados
+        const query = 'INSERT INTO clientes (name, username, password, data_nasc, terms_accepted, privacy_accepted) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id';
+        const values = [name, username, hashedPassword, data_nasc, terms_accepted, privacy_accepted];
 
-      // Aqui, estamos recebendo o ID do usuário recém-criado.
-      const userId = userResult.rows[0].id;
+        userResult = await client.query(query, values);
 
-      // Exclua o token antigo do banco de dados, se houver
-      await client.query('DELETE FROM email_verifications WHERE user_id = $1', [userId]);
+        // Aqui, estamos recebendo o ID do usuário recém-criado.
+        const userId = userResult.rows[0].id;
 
-      // Gere um novo token seguro
-      const token = randomBytes(32).toString('hex');
+        // Exclua o token antigo do banco de dados, se houver
+        await client.query('DELETE FROM email_verifications WHERE user_id = $1', [userId]);
 
-      // Defina a data de expiração para 1 hora a partir de agora
-      const expiresAt = new Date();
-      expiresAt.setTime(expiresAt.getTime() + 1 * 60 * 60 * 1000);
+        // Gere um novo token seguro
+        token = randomBytes(32).toString('hex');
 
-      // Insira o novo token no banco de dados
-      await client.query(
-        'INSERT INTO email_verifications (user_id, token, expires_at) VALUES ($1, $2, $3)',
-        [userId, token, expiresAt]
-      );
+        // Defina a data de expiração para 1 hora a partir de agora
+        const expiresAt = new Date();
+        expiresAt.setTime(expiresAt.getTime() + 1 * 60 * 60 * 1000);
 
-      // Encerra a transação
+        // Insira o novo token no banco de dados
+        const insertTokenQuery = 'INSERT INTO email_verifications (user_id, token, expires_at) VALUES ($1, $2, $3)';
+        await client.query(insertTokenQuery, [userId, token, expiresAt]);
+
+      } catch (err) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ error: 'Erro ao adicionar usuário ao banco de dados.' });
+      }
+
+      // Encerrar transação
       await client.query('COMMIT');
 
       // Gere a URL de verificação
       const verificationUrl = `${req.protocol}://${req.get('host')}/usuarios/verificar-email/${token}`;
-
+  
       // Use a função getEmailVerificationTemplate para gerar o corpo do email
       const emailBody = `
         <html>
@@ -262,10 +323,10 @@ export class UserController {
           </body>
         </html>
       `;
-
+  
       // Envie o email de verificação
       await sendEmail(username, 'Verifique seu endereço de email', emailBody);
-
+  
       return res.status(200).json({ message: "Registro bem-sucedido! Verifique o seu e-mail." });
     } catch (err) {
       // Se algo der errado, faz o rollback da transação
@@ -275,6 +336,7 @@ export class UserController {
       client.release();
     }
   }
+  
   
 
   private async verifyEmail(req: Request, res: Response): Promise<Response> {
