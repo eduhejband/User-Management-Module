@@ -1,4 +1,4 @@
-import { Application, Request, Response } from 'express';
+import { Application, Request, Response,NextFunction  } from 'express';
 import { check, validationResult } from 'express-validator';
 import { DbClient } from './DbClient';
 import bcrypt from 'bcrypt';
@@ -6,15 +6,20 @@ import { randomBytes } from 'crypto';
 import { sendEmail } from './mail_config';
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { Strategy as JwtStrategy, ExtractJwt, VerifiedCallback } from 'passport-jwt';
 import { QueryResult } from 'pg';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken'; // substitua por sua própria configuração de secret
+import { jwtSecret } from './config';
+
 export class UserController {
   private dbClient: DbClient;
 
   constructor(app: Application) {
     this.dbClient = new DbClient();
     this.configureRoutes(app);
+
     setInterval(async () => {
       const client = await this.dbClient.connect();
       try {
@@ -35,6 +40,29 @@ export class UserController {
       callbackURL: process.env.CALLBACK_URL
     },
     this.googleAuthCallback.bind(this))); // Método de callback para tratar a resposta do Google
+
+    passport.use(new JwtStrategy({
+        jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+        secretOrKey: process.env.JWT_SECRET
+    }, async function(this: UserController, jwt_payload: any, done: VerifiedCallback) {
+        const client = await this.dbClient.connect();
+        try {
+            const result = await this.dbClient.queryWithParams(
+                client,
+                'SELECT * FROM clientes WHERE id = $1',
+                [jwt_payload.id]
+            );
+            if (result.rows.length > 0) {
+                return done(null, result.rows[0]);
+            } else {
+                return done(null, false);
+            }
+        } catch (err) {
+            return done(err, false);
+        } finally {
+            client.release();
+        }
+    }.bind(this)));
   }
   
 
@@ -58,10 +86,11 @@ export class UserController {
       check('privacy_accepted').isBoolean().withMessage('Privacy acceptance is required')
     ], this.register.bind(this));
     
-    app.post('/login', loginLimiter, [
-      check('username').isEmail().withMessage('Invalid e-mail format'),
-      check('password').notEmpty().withMessage('Password is required')
-    ], this.login.bind(this));
+    app.route('/login')
+      .post([
+        check('username').notEmpty().withMessage('Username is required'),
+        check('password').notEmpty().withMessage('Password is required')
+      ], this.login.bind(this));
 
     app.post('/update-name', [
       check('username').isEmail().withMessage('Invalid e-mail format'),
@@ -113,7 +142,40 @@ export class UserController {
     app.post('/insert-birthdate-auth', [
       check('birthdate').notEmpty().withMessage('Data de nascimento é obrigatória'),
     ], this.insertBirthdateAuth.bind(this));
+
+    app.get('/path', this.authenticateJWT, (req, res) => {
+      res.json({message: "Você está autorizado!"});
+    });
+
+    app.route('/logout')
+      .post([
+        this.authenticateJWT
+      ], this.logout.bind(this));
   }
+
+  private authenticateJWT(req: Request, res: Response, next: NextFunction) {
+    const authHeader = req.headers.authorization;
+      
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+  
+      jwt.verify(token, jwtSecret, (err, user) => {
+        if (err) {
+          return res.sendStatus(403);
+        }
+  
+        req.user = user;
+        next();
+      });
+    } else {
+      res.sendStatus(401);
+    }
+};
+
+async logout(req: Request, res: Response) {
+  // como o JWT é stateless, para fazer logout o cliente simplesmente descarta o token.
+  res.sendStatus(200);
+}
 
   // E então, adicione o método registerWhatsAppNumber no UserController
   private async registerWhatsAppNumber(req: Request, res: Response) {
@@ -479,7 +541,7 @@ export class UserController {
   
   private async login(req: Request, res: Response): Promise<Response> {
     const client = await this.dbClient.connect();
-  
+    
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
@@ -511,13 +573,18 @@ export class UserController {
         // Senha fornecida não corresponde à senha do usuário
         return res.status(401).json({ message: "Login falhou. Usuário ou senha inválidos." });
       }
+  
+      // Gerar um token de acesso
+      const accessToken = jwt.sign({ userId: user.id }, jwtSecret, { expiresIn: '1h' });
     
       // O login foi bem-sucedido
-      return res.status(200).json({ message: "Login bem-sucedido!" });
+      return res.status(200).json({ message: "Login bem-sucedido!", accessToken });
     } finally {
       client.release();
     }
   }
+  
+  
   
   private async updateName(req: Request, res: Response): Promise<Response> {
     const { username, newName } = req.body;
@@ -578,4 +645,5 @@ export class UserController {
       client.release();
     }
   }
+
 }  
